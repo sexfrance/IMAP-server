@@ -36,7 +36,6 @@ struct SupabaseUser {
 #[derive(Debug, Deserialize, Clone, sqlx::FromRow)]
 struct Inbox {
     email_address: String,
-    user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, sqlx::FromRow)]
@@ -1012,10 +1011,10 @@ async fn get_emails_for_mailbox(pool: &PgPool, mailbox: &str) -> Result<Vec<Emai
 }
 
 /// Get ONLY user's inboxes
-async fn get_user_inboxes(config: &Config, pool: &PgPool, user_id: &str) -> Result<Vec<Inbox>> {
+async fn get_user_inboxes(_config: &Config, pool: &PgPool, user_id: &str) -> Result<Vec<Inbox>> {
     // Always use local PostgreSQL
     let inboxes: Vec<Inbox> = sqlx::query_as(
-        "SELECT email_address, user_id FROM inbox WHERE user_id = $1",
+        "SELECT email_address FROM inbox WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -1247,7 +1246,7 @@ async fn validate_domain_cached(
 }
 
 /// Create a new inbox for user
-async fn create_inbox(config: &Config, pool: &PgPool, user_id: &str, email_address: &str) -> Result<()> {
+async fn create_inbox(_config: &Config, pool: &PgPool, user_id: &str, email_address: &str) -> Result<()> {
     // Always use local PostgreSQL
     sqlx::query(
         "INSERT INTO inbox (user_id, email_address) VALUES ($1, $2)",
@@ -1260,7 +1259,7 @@ async fn create_inbox(config: &Config, pool: &PgPool, user_id: &str, email_addre
 }
 
 /// Delete an inbox for user
-async fn delete_inbox(config: &Config, pool: &PgPool, user_id: &str, email_address: &str) -> Result<()> {
+async fn delete_inbox(_config: &Config, pool: &PgPool, user_id: &str, email_address: &str) -> Result<()> {
     // Always use local PostgreSQL
     sqlx::query(
         "DELETE FROM inbox WHERE user_id = $1 AND email_address = $2",
