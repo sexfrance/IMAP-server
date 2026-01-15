@@ -279,8 +279,8 @@ async fn handle_conn(
             continue;
         }
 
-        let tag = "".to_string();
-        let mut parts = trimmed.splitn(2, ' ');
+        let mut parts = trimmed.splitn(3, ' ');
+        let tag = parts.next().unwrap_or("").to_string();
         let cmd = parts.next().unwrap_or("").to_uppercase();
         let args = parts.next().unwrap_or("").to_string();
 
@@ -288,20 +288,20 @@ async fn handle_conn(
 
         match cmd.as_str() {
             "" => {
-                w.write_all("BAD Empty command\r\n".as_bytes()).await?;
+                w.write_all(format!("{} BAD Empty command\r\n", tag).as_bytes()).await?;
             }
             "CAPABILITY" => {
                 seen_valid_imap = true;
                 w.write_all(b"* CAPABILITY IMAP4rev1 AUTH=PLAIN UIDPLUS MOVE IDLE LITERAL+\r\n").await?;
-                w.write_all("OK CAPABILITY completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK CAPABILITY completed\r\n", tag).as_bytes()).await?;
             }
             "NOOP" => {
                 seen_valid_imap = true;
-                w.write_all("OK NOOP completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK NOOP completed\r\n", tag).as_bytes()).await?;
             }
             "LOGOUT" => {
                 w.write_all(b"* BYE IMAP server logging out\r\n").await?;
-                w.write_all("OK LOGOUT completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK LOGOUT completed\r\n", tag).as_bytes()).await?;
                 w.flush().await?;
                 info!("[{}] client logged out", peer);
                 return Ok(());
@@ -309,7 +309,7 @@ async fn handle_conn(
             "LOGIN" => {
                 seen_valid_imap = true;
                 if authenticated_user.is_some() {
-                    w.write_all("NO Already authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Already authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -317,7 +317,7 @@ async fn handle_conn(
                 info!(%peer, login_args=?login_args, "login_args");
 
                 if login_args.len() < 2 {
-                    w.write_all("BAD LOGIN requires user and password\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD LOGIN requires user and password\r\n", tag).as_bytes()).await?;
                     continue;
                 }
                 let user = login_args[0].to_string();
@@ -328,11 +328,11 @@ async fn handle_conn(
                     Ok((user_id_result, user_email)) => {
                         authenticated_user = Some(user_email.clone());
                         user_id = Some(user_id_result);
-                        w.write_all("OK LOGIN completed\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} OK LOGIN completed\r\n", tag).as_bytes()).await?;
                         info!(%peer, user=%user, "login success");
                     }
                     Err(e) => {
-                        w.write_all(format!("NO LOGIN failed: {}\r\n", e).as_bytes()).await?;
+                        w.write_all(format!("{} NO LOGIN failed: {}\r\n", tag, e).as_bytes()).await?;
                         info!(%peer, user=%user, error=%e, "login failed");
                     }
                 }
@@ -340,7 +340,7 @@ async fn handle_conn(
             "LIST" => {
                 seen_valid_imap = true;
                 if authenticated_user.is_none() || user_id.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -365,24 +365,24 @@ async fn handle_conn(
                                 .await?;
                             }
                         }
-                        w.write_all("OK LIST completed\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} OK LIST completed\r\n", tag).as_bytes()).await?;
                     }
                     Err(e) => {
                         error!("Failed to get user inboxes from Supabase: {}", e);
-                        w.write_all("NO Failed to get mailboxes\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} NO Failed to get mailboxes\r\n", tag).as_bytes()).await?;
                     }
                 }
             }
             "SELECT" => {
                 seen_valid_imap = true;
                 if authenticated_user.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 let mailbox_name = args.trim().trim_matches('"').to_string();
                 if mailbox_name.is_empty() {
-                    w.write_all("BAD SELECT requires mailbox name\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD SELECT requires mailbox name\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -390,7 +390,7 @@ async fn handle_conn(
 
                 // Deny selection if the mailbox address is explicitly banned
                 if is_email_banned(&config, &pool, &mailbox_name).await {
-                    w.write_all("NO Mailbox is banned\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Mailbox is banned\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -406,7 +406,7 @@ async fn handle_conn(
                 w.write_all(b"* OK [UIDVALIDITY 1] UIDs valid\r\n").await?;
                 w.write_all(b"* OK [UIDNEXT 1000] Predicted next UID\r\n").await?;
                 w.write_all(b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n").await?;
-                w.write_all("OK [READ-WRITE] SELECT completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK [READ-WRITE] SELECT completed\r\n", tag).as_bytes()).await?;
 
                 selected_mailbox = Some(mailbox_name.clone());
                 info!(%peer, mailbox=%mailbox_name, count=%email_count, "mailbox selected successfully");
@@ -415,12 +415,12 @@ async fn handle_conn(
                 // Support FETCH with various data items: BODY[], BODY.PEEK[TEXT], etc.
                 seen_valid_imap = true;
                 if authenticated_user.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 if selected_mailbox.is_none() {
-                    w.write_all("NO No mailbox selected\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO No mailbox selected\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -437,7 +437,7 @@ async fn handle_conn(
                 };
 
                 if emails.is_empty() {
-                    w.write_all("OK FETCH completed (no emails)\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} OK FETCH completed (no emails)\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -445,7 +445,7 @@ async fn handle_conn(
                 // Example: "1 (BODY.PEEK[TEXT])" or "1:* (BODY[])"
                 let args_trimmed = args.trim();
                 if args_trimmed.is_empty() {
-                    w.write_all("BAD FETCH requires arguments\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD FETCH requires arguments\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -453,7 +453,7 @@ async fn handle_conn(
                 let paren_pos = match args_trimmed.find('(') {
                     Some(pos) => pos,
                     None => {
-                        w.write_all("BAD FETCH malformed data items\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} BAD FETCH malformed data items\r\n", tag).as_bytes()).await?;
                         continue;
                     }
                 };
@@ -462,7 +462,7 @@ async fn handle_conn(
                 let data_items_str = &args_trimmed[paren_pos..].trim();
 
                 if !data_items_str.starts_with('(') || !data_items_str.ends_with(')') {
-                    w.write_all("BAD FETCH malformed data items\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD FETCH malformed data items\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -520,23 +520,23 @@ async fn handle_conn(
                             w.write_all(b"\r\n").await?;
                         } else {
                             // Unsupported data item
-                            w.write_all(format!("BAD FETCH unsupported data item: {}\r\n", data_items).as_bytes()).await?;
+                            w.write_all(format!("{} BAD FETCH unsupported data item: {}\r\n", tag, data_items).as_bytes()).await?;
                             continue;
                         }
                     }
                 }
-                w.write_all("OK FETCH completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK FETCH completed\r\n", tag).as_bytes()).await?;
             }
             "SEARCH" => {
                 // Basic SEARCH implementation supporting: ALL, FROM <addr>, SUBJECT <text>
                 seen_valid_imap = true;
                 if authenticated_user.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 if selected_mailbox.is_none() {
-                    w.write_all("NO No mailbox selected\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO No mailbox selected\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -587,7 +587,7 @@ async fn handle_conn(
                         }
                     }
                 } else {
-                    w.write_all("BAD SEARCH unsupported or malformed (supported: ALL, FROM, SUBJECT)\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD SEARCH unsupported or malformed (supported: ALL, FROM, SUBJECT)\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -598,13 +598,13 @@ async fn handle_conn(
                     w.write_all(format!("* SEARCH {}\r\n", list).as_bytes()).await?;
                 }
 
-                w.write_all("OK SEARCH completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK SEARCH completed\r\n", tag).as_bytes()).await?;
             }
             "STATUS" => {
                 // STATUS "mailbox" (MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN)
                 seen_valid_imap = true;
                 if authenticated_user.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -613,7 +613,7 @@ async fn handle_conn(
                 let mailbox_name = mailbox_raw.trim_matches('"');
 
                 if mailbox_name.is_empty() {
-                    w.write_all("BAD STATUS requires mailbox name\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD STATUS requires mailbox name\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -621,25 +621,25 @@ async fn handle_conn(
                 let unseen = get_unseen_count(&pool, mailbox_name).await.unwrap_or(0);
 
                 w.write_all(format!("* STATUS \"{}\" (MESSAGES {} RECENT {} UNSEEN {})\r\n", mailbox_name, msg_count, 0, unseen).as_bytes()).await?;
-                w.write_all("OK STATUS completed\r\n".as_bytes()).await?;
+                w.write_all(format!("{} OK STATUS completed\r\n", tag).as_bytes()).await?;
             }
             "CREATE" => {
                 seen_valid_imap = true;
                 if authenticated_user.is_none() || user_id.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 let new_inbox = args.trim().trim_matches('"').to_string();
                 if new_inbox.is_empty() {
-                    w.write_all("BAD CREATE requires mailbox name\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD CREATE requires mailbox name\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 let domain = match new_inbox.split('@').nth(1) {
                     Some(domain) => domain.to_string(),
                     None => {
-                        w.write_all("NO Invalid email format. Use: username@domain.com\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} NO Invalid email format. Use: username@domain.com\r\n", tag).as_bytes()).await?;
                         continue;
                     }
                 };
@@ -648,13 +648,13 @@ async fn handle_conn(
 
                 // Deny creation if the domain is actively banned (global domain ban)
                 if is_domain_banned(&config, &pool, &domain).await {
-                    w.write_all("NO Domain is banned\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Domain is banned\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 // Deny creation if the mailbox address itself is explicitly banned (scope=email)
                 if is_email_banned(&config, &pool, &new_inbox).await {
-                    w.write_all("NO Mailbox is banned\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Mailbox is banned\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
@@ -663,54 +663,54 @@ async fn handle_conn(
                         // Create inbox in PostgreSQL
                         match create_inbox(&config, &pool, user_id.as_ref().unwrap(), &new_inbox).await {
                             Ok(_) => {
-                                w.write_all("OK CREATE completed\r\n".as_bytes()).await?;
+                                w.write_all(format!("{} OK CREATE completed\r\n", tag).as_bytes()).await?;
                                 info!(%peer, mailbox=%new_inbox, "mailbox created in Supabase");
                             }
                             Err(e) => {
-                                w.write_all(format!("NO CREATE failed: {}\r\n", e).as_bytes()).await?;
+                                w.write_all(format!("{} NO CREATE failed: {}\r\n", tag, e).as_bytes()).await?;
                             }
                         }
                     }
                     Ok(false) => {
-                        w.write_all("NO Domain not found or not active. Please add the domain first.\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} NO Domain not found or not active. Please add the domain first.\r\n", tag).as_bytes()).await?;
                     }
                     Err(e) => {
-                        w.write_all(format!("NO Failed to validate domain: {}\r\n", e).as_bytes()).await?;
+                        w.write_all(format!("{} NO Failed to validate domain: {}\r\n", tag, e).as_bytes()).await?;
                     }
                 }
             }
             "DELETE" => {
                 seen_valid_imap = true;
                 if authenticated_user.is_none() || user_id.is_none() {
-                    w.write_all("NO Not authenticated\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Not authenticated\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 let mailbox_to_delete = args.trim().trim_matches('"').to_string();
                 if mailbox_to_delete.is_empty() {
-                    w.write_all("BAD DELETE requires mailbox name\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} BAD DELETE requires mailbox name\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 if mailbox_to_delete == "INBOX" {
-                    w.write_all("NO Cannot delete INBOX\r\n".as_bytes()).await?;
+                    w.write_all(format!("{} NO Cannot delete INBOX\r\n", tag).as_bytes()).await?;
                     continue;
                 }
 
                 match delete_inbox(&config, &pool, user_id.as_ref().unwrap(), &mailbox_to_delete).await {
                     Ok(_) => {
-                        w.write_all("OK DELETE completed\r\n".as_bytes()).await?;
+                        w.write_all(format!("{} OK DELETE completed\r\n", tag).as_bytes()).await?;
                         info!(%peer, mailbox=%mailbox_to_delete, "mailbox deleted from PostgreSQL");
                     }
                     Err(e) => {
-                        w.write_all(format!("NO DELETE failed: {}\r\n", e).as_bytes()).await?;
+                        w.write_all(format!("{} NO DELETE failed: {}\r\n", tag, e).as_bytes()).await?;
                     }
                 }
             }
             _ => {
                 if seen_valid_imap {
                     warn!(%peer, command=%cmd, "unrecognized IMAP command");
-                    w.write_all(format!("BAD Unrecognized command: {}\r\n", cmd).as_bytes()).await?;
+                    w.write_all(format!("{} BAD Unrecognized command: {}\r\n", tag, cmd).as_bytes()).await?;
                 } else {
                     info!("[{}] rejecting non-IMAP command: {}", peer, cmd);
                     w.write_all(b"* BAD Invalid IMAP command\r\n").await?;
