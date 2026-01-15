@@ -320,8 +320,8 @@ async fn handle_conn(
                     w.write_all(format!("{} BAD LOGIN requires user and password\r\n", tag).as_bytes()).await?;
                     continue;
                 }
-                let user = login_args[0].to_string();
-                let pass = login_args[1].to_string();
+                let user = login_args[0].trim_matches('"').to_string();
+                let pass = login_args[1].trim_matches('"').to_string();
 
                 info!(%peer, user=%user, "attempting login");
                 match verify_user(&config, &user, &pass).await {
