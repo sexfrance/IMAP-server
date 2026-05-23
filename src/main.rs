@@ -27,11 +27,10 @@ struct Config {
     use_domains: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SupabaseUser {
-    id: String,
-    email: String,
-}
+// SupabaseUser / ImapToken structs were the JSON shapes returned by
+// the old REST-based verify_user. Now that verify_user uses a direct
+// SQL JOIN and returns a plain tuple, neither struct has any
+// consumer left — removed to keep the type surface honest.
 
 #[derive(Debug, Deserialize, Clone, sqlx::FromRow)]
 struct Inbox {
@@ -44,13 +43,6 @@ struct Domain {
     user_id: String,
     active: bool,
     cloudflare_domain: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ImapToken {
-    id: String,
-    user_id: String,
-    expires_at: DateTime<Utc>,
 }
 
 /// Cache structure for domains
@@ -167,14 +159,33 @@ async fn main() -> Result<()> {
         .parse()
         .context("IMAP_BIND must be in format IP:PORT (e.g., 0.0.0.0:143)")?;
 
+    // Supabase config is now optional. The auth-critical path
+    // (`verify_user`) talks directly to Postgres; the remaining
+    // Supabase REST callers (bans, domains, sender-bans) already
+    // have Postgres fallback paths gated on USE_SUPABASE_BANS /
+    // USE_SUPABASE_DOMAINS. Defaulting both flags to "false" so a
+    // fresh deploy without any SUPABASE_* env vars set is fully
+    // self-hosted by default — old deploys that have the vars set
+    // still work unchanged.
     let supabase_config = Config {
-        url: std::env::var("SUPABASE_URL").context("SUPABASE_URL environment variable is required")?,
+        url: std::env::var("SUPABASE_URL").unwrap_or_default(),
         key: std::env::var("SUPABASE_SERVICE_KEY")
             .or_else(|_| std::env::var("SUPABASE_KEY"))
-            .context("SUPABASE_SERVICE_KEY or SUPABASE_KEY environment variable is required")?,
-        use_bans: std::env::var("USE_SUPABASE_BANS").unwrap_or_else(|_| "true".to_string()) == "true",
-        use_domains: std::env::var("USE_SUPABASE_DOMAINS").unwrap_or_else(|_| "true".to_string()) == "true",
+            .unwrap_or_default(),
+        use_bans: std::env::var("USE_SUPABASE_BANS").unwrap_or_else(|_| "false".to_string()) == "true",
+        use_domains: std::env::var("USE_SUPABASE_DOMAINS").unwrap_or_else(|_| "false".to_string()) == "true",
     };
+    if supabase_config.use_bans || supabase_config.use_domains {
+        if supabase_config.url.is_empty() || supabase_config.key.is_empty() {
+            anyhow::bail!(
+                "USE_SUPABASE_BANS / USE_SUPABASE_DOMAINS is set but SUPABASE_URL or \
+                 SUPABASE_SERVICE_KEY is missing. Either populate both or set both \
+                 USE_SUPABASE_* flags to false to use Postgres-only mode.",
+            );
+        }
+    } else {
+        info!("✓ Self-hosted Postgres mode (Supabase REST disabled for bans + domains)");
+    }
 
     let database_url = std::env::var("DATABASE_URL")?;
 
@@ -323,7 +334,7 @@ async fn handle_conn(
                 let pass = login_args[1].trim_matches('"').to_string();
 
                 info!(%peer, user=%user, "attempting login");
-                match verify_user(&config, &user, &pass).await {
+                match verify_user(&pool, &user, &pass).await {
                     Ok((user_id_result, user_email)) => {
                         authenticated_user = Some(user_email.clone());
                         user_id = Some(user_id_result);
@@ -1023,151 +1034,102 @@ async fn get_user_inboxes(_config: &Config, pool: &PgPool, user_id: &str) -> Res
     Ok(inboxes)
 }
 
-/// Verify using IMAP tokens with service role key
-async fn verify_user(config: &Config, user: &str, token: &str) -> Result<(String, String)> {
-    let client = reqwest::Client::new();
+/// Verify an IMAP login against Postgres directly.
+///
+/// Previous implementation made three sequential round-trips to
+/// Supabase REST (token lookup → admin /auth/v1/admin/users/<uuid>
+/// → users-table lookup for subscription) plus a PATCH for
+/// last_used_at. Total ~4 HTTP requests per LOGIN, none cacheable,
+/// each one ~50–150ms over the public Supabase hostname. After the
+/// rest of the stack moved to self-hosted Postgres, IMAP logins
+/// were the only thing still hitting Supabase at all — and once a
+/// project's Supabase egress went over plan, IMAP logins started
+/// timing out under load.
+///
+/// New implementation: ONE SQL query that joins `imap_tokens` to
+/// `users` and pulls everything we need in a single round-trip. The
+/// PATCH for last_used_at stays but goes to the same Postgres pool
+/// — no Supabase REST anywhere on this code path.
+async fn verify_user(pool: &PgPool, user: &str, token: &str) -> Result<(String, String)> {
+    info!("🔍 Verifying IMAP login for {} (token prefix: {})",
+          user,
+          &token.chars().take(8).collect::<String>());
 
-    info!("🔍 Looking for token: {}", token);
-
-    let token_url = format!("{}/rest/v1/imap_tokens?token=eq.{}", config.url, token);
-    info!("📡 Token URL: {}", token_url);
-
-    let token_response = client
-        .get(&token_url)
-        .header("apikey", &config.key)
-        .header("Authorization", format!("Bearer {}", config.key))
-        .header("Content-Type", "application/json")
-        .send()
+    // Joined fetch: token row + owning user row, in one shot. The
+    // explicit cast of user_id to TEXT lets us return a plain string
+    // tuple from sqlx without dragging the uuid feature into types
+    // we don't otherwise need here.
+    let row: Option<(String, String, String, DateTime<Utc>, Option<String>, Option<DateTime<Utc>>)> =
+        sqlx::query_as(
+            r#"
+            SELECT
+                t.id::text                   AS token_id,
+                t.user_id::text              AS user_id,
+                COALESCE(u.email, '')        AS email,
+                t.expires_at                 AS expires_at,
+                u.subscription_status        AS subscription_status,
+                u.subscription_end_date      AS subscription_end_date
+            FROM imap_tokens t
+            JOIN users u ON u.id = t.user_id
+            WHERE t.token = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(token)
+        .fetch_optional(pool)
         .await
-        .context("Failed to verify IMAP token")?;
+        .context("Failed to query imap_tokens/users")?;
 
-    let token_status = token_response.status();
-    info!("📊 Token response status: {}", token_status);
-
-    if token_status.is_success() {
-        let tokens: Vec<ImapToken> = token_response.json().await.context("Failed to parse IMAP tokens from JSON")?;
-
-        info!("🔍 Found {} tokens", tokens.len());
-
-        if let Some(token_data) = tokens.get(0) {
-            info!("✅ Token found for user_id: {}", token_data.user_id);
-
-            if token_data.expires_at > Utc::now() {
-                info!("✅ Token is not expired");
-
-                let user_url = format!("{}/auth/v1/admin/users/{}", config.url, token_data.user_id);
-                info!("📡 User URL: {}", user_url);
-
-                let user_response = client
-                    .get(&user_url)
-                    .header("apikey", &config.key)
-                    .header("Authorization", format!("Bearer {}", config.key))
-                    .send()
-                    .await
-                    .context("Failed to get user details")?;
-
-                let user_status = user_response.status();
-                info!("📊 User response status: {}", user_status);
-
-                if user_status.is_success() {
-                    let user_data: SupabaseUser = user_response.json().await.context("Failed to parse user response")?;
-
-                    info!("✅ User found: {}", user_data.email);
-
-                    if user_data.email == user {
-                        info!("✅ Email matches: {} == {}", user_data.email, user);
-
-                        // Check user's subscription status
-                        let user_details_url = format!("{}/rest/v1/users?id=eq.{}", config.url, user_data.id);
-                        info!("📡 User details URL: {}", user_details_url);
-
-                        let user_details_response = client
-                            .get(&user_details_url)
-                            .header("apikey", &config.key)
-                            .header("Authorization", format!("Bearer {}", config.key))
-                            .send()
-                            .await
-                            .context("Failed to get user subscription details")?;
-
-                        if user_details_response.status().is_success() {
-                            let user_details: Vec<serde_json::Value> = user_details_response.json().await.context("Failed to parse user details")?;
-
-                            if let Some(user_detail) = user_details.get(0) {
-                                let subscription_status = user_detail.get("subscription_status").and_then(|s| s.as_str()).unwrap_or("inactive");
-
-                                let subscription_end_date = user_detail.get("subscription_end_date").and_then(|d| d.as_str());
-
-                                info!("📊 User subscription status: {}, end_date: {:?}", subscription_status, subscription_end_date);
-
-                                let is_active = match subscription_status {
-                                    "active" => true,
-                                    "trialing" => true,
-                                    _ => {
-                                        if subscription_status == "past_due" {
-                                            if let Some(end_date_str) = subscription_end_date {
-                                                if let Ok(end_date) = chrono::DateTime::parse_from_rfc3339(end_date_str) {
-                                                    end_date.with_timezone(&Utc) > Utc::now()
-                                                } else {
-                                                    false
-                                                }
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
-                                        }
-                                    }
-                                };
-
-                                if !is_active {
-                                    info!("❌ User subscription is not active: {}", subscription_status);
-                                    anyhow::bail!("Your subscription is not active. Please renew your subscription to use IMAP.");
-                                }
-
-                                info!("✅ User subscription is active");
-                            } else {
-                                info!("❌ No user details found");
-                                anyhow::bail!("Failed to fetch user subscription details");
-                            }
-                        } else {
-                            info!("❌ User details API returned status: {}", user_details_response.status());
-                            anyhow::bail!("Failed to fetch user subscription details");
-                        }
-
-                        let _ = client
-                            .patch(&format!("{}/rest/v1/imap_tokens?id=eq.{}", config.url, token_data.id))
-                            .header("apikey", &config.key)
-                            .header("Authorization", format!("Bearer {}", config.key))
-                            .header("Content-Type", "application/json")
-                            .json(&serde_json::json!({
-                                "last_used_at": Utc::now().to_rfc3339()
-                            }))
-                            .send()
-                            .await;
-
-                        info!("✅ Last_used_at updated successfully");
-
-                        return Ok((user_data.id.clone(), user_data.email.clone()));
-                    } else {
-                        info!("❌ Email mismatch: {} != {}", user_data.email, user);
-                        anyhow::bail!("Email does not match token owner");
-                    }
-                } else {
-                    info!("❌ User API returned status: {}", user_status);
-                    anyhow::bail!("Failed to fetch user details");
-                }
-            } else {
-                info!("❌ Token expired at: {}", token_data.expires_at);
-                anyhow::bail!("IMAP token has expired");
+    let (token_id, user_id, email, expires_at, subscription_status, subscription_end_date) =
+        match row {
+            Some(r) => r,
+            None => {
+                info!("❌ No token row matching the credential");
+                anyhow::bail!("Invalid IMAP token");
             }
-        } else {
-            info!("❌ No token found matching: {}", token);
-            anyhow::bail!("Invalid IMAP token");
-        }
-    } else {
-        info!("❌ Token API returned status: {}", token_status);
-        anyhow::bail!("Failed to verify token");
+        };
+
+    if expires_at <= Utc::now() {
+        info!("❌ Token expired at {}", expires_at);
+        anyhow::bail!("IMAP token has expired");
     }
+
+    if email != user {
+        info!("❌ Email mismatch: token owner = {}, login claim = {}", email, user);
+        anyhow::bail!("Email does not match token owner");
+    }
+
+    // Subscription gate. Stays loose enough that a `past_due` user
+    // whose period hasn't yet ended can still read their mail —
+    // matches the policy the web app uses for getMail / inbox-list.
+    let status = subscription_status.as_deref().unwrap_or("inactive");
+    let is_active = match status {
+        "active" | "trialing" => true,
+        "past_due" => subscription_end_date
+            .map(|d| d > Utc::now())
+            .unwrap_or(false),
+        _ => false,
+    };
+
+    if !is_active {
+        info!("❌ Subscription not active for {} (status: {})", email, status);
+        anyhow::bail!("Your subscription is not active. Please renew to use IMAP.");
+    }
+
+    // Fire-and-forget last_used_at bump. If this update fails
+    // (transient pool exhaustion, table-level lock, etc.) we don't
+    // want to fail the login — the user already proved they own
+    // the token. Log the error but return OK.
+    let updated = sqlx::query("UPDATE imap_tokens SET last_used_at = NOW() WHERE id = $1::uuid")
+        .bind(&token_id)
+        .execute(pool)
+        .await;
+    if let Err(e) = updated {
+        warn!("⚠ Failed to bump last_used_at for token {}: {}", token_id, e);
+    }
+
+    info!("✅ IMAP login authenticated for {} (status: {})", email, status);
+    Ok((user_id, email))
 }
 
 /// Fetch all domains
